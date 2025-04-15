@@ -1,4 +1,4 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 from typing import List
 from urllib.parse import urlsplit
@@ -10,6 +10,9 @@ class TritonRemoteModel:
     """
     Client for interacting with a remote Triton Inference Server model.
 
+    This class provides a convenient interface for sending inference requests to a Triton Inference Server
+    and processing the responses.
+
     Attributes:
         endpoint (str): The name of the model on the Triton server.
         url (str): The URL of the Triton server.
@@ -20,14 +23,21 @@ class TritonRemoteModel:
         np_input_formats (List[type]): The numpy data types of the model inputs.
         input_names (List[str]): The names of the model inputs.
         output_names (List[str]): The names of the model outputs.
+        metadata: The metadata associated with the model.
+
+    Examples:
+        Initialize a Triton client with HTTP
+        >>> model = TritonRemoteModel(url="localhost:8000", endpoint="yolov8", scheme="http")
+        Make inference with numpy arrays
+        >>> outputs = model(np.random.rand(1, 3, 640, 640).astype(np.float32))
     """
 
-    def __init__(self, url: str, endpoint: str = '', scheme: str = ''):
+    def __init__(self, url: str, endpoint: str = "", scheme: str = ""):
         """
         Initialize the TritonRemoteModel.
 
         Arguments may be provided individually or parsed from a collective 'url' argument of the form
-            <scheme>://<netloc>/<endpoint>/<task_name>
+        <scheme>://<netloc>/<endpoint>/<task_name>
 
         Args:
             url (str): The URL of the Triton server.
@@ -36,7 +46,7 @@ class TritonRemoteModel:
         """
         if not endpoint and not scheme:  # Parse all args from URL string
             splits = urlsplit(url)
-            endpoint = splits.path.strip('/').split('/')[0]
+            endpoint = splits.path.strip("/").split("/")[0]
             scheme = splits.scheme
             url = splits.netloc
 
@@ -44,43 +54,46 @@ class TritonRemoteModel:
         self.url = url
 
         # Choose the Triton client based on the communication scheme
-        if scheme == 'http':
+        if scheme == "http":
             import tritonclient.http as client  # noqa
+
             self.triton_client = client.InferenceServerClient(url=self.url, verbose=False, ssl=False)
             config = self.triton_client.get_model_config(endpoint)
         else:
             import tritonclient.grpc as client  # noqa
+
             self.triton_client = client.InferenceServerClient(url=self.url, verbose=False, ssl=False)
-            config = self.triton_client.get_model_config(endpoint, as_json=True)['config']
+            config = self.triton_client.get_model_config(endpoint, as_json=True)["config"]
 
         # Sort output names alphabetically, i.e. 'output0', 'output1', etc.
-        config['output'] = sorted(config['output'], key=lambda x: x.get('name'))
+        config["output"] = sorted(config["output"], key=lambda x: x.get("name"))
 
         # Define model attributes
-        type_map = {'TYPE_FP32': np.float32, 'TYPE_FP16': np.float16, 'TYPE_UINT8': np.uint8}
+        type_map = {"TYPE_FP32": np.float32, "TYPE_FP16": np.float16, "TYPE_UINT8": np.uint8}
         self.InferRequestedOutput = client.InferRequestedOutput
         self.InferInput = client.InferInput
-        self.input_formats = [x['data_type'] for x in config['input']]
+        self.input_formats = [x["data_type"] for x in config["input"]]
         self.np_input_formats = [type_map[x] for x in self.input_formats]
-        self.input_names = [x['name'] for x in config['input']]
-        self.output_names = [x['name'] for x in config['output']]
+        self.input_names = [x["name"] for x in config["input"]]
+        self.output_names = [x["name"] for x in config["output"]]
+        self.metadata = eval(config.get("parameters", {}).get("metadata", {}).get("string_value", "None"))
 
     def __call__(self, *inputs: np.ndarray) -> List[np.ndarray]:
         """
         Call the model with the given inputs.
 
         Args:
-            *inputs (List[np.ndarray]): Input data to the model.
+            *inputs (np.ndarray): Input data to the model.
 
         Returns:
-            List[np.ndarray]: Model outputs.
+            (List[np.ndarray]): Model outputs with the same dtype as the input.
         """
         infer_inputs = []
         input_format = inputs[0].dtype
         for i, x in enumerate(inputs):
             if x.dtype != self.np_input_formats[i]:
                 x = x.astype(self.np_input_formats[i])
-            infer_input = self.InferInput(self.input_names[i], [*x.shape], self.input_formats[i].replace('TYPE_', ''))
+            infer_input = self.InferInput(self.input_names[i], [*x.shape], self.input_formats[i].replace("TYPE_", ""))
             infer_input.set_data_from_numpy(x)
             infer_inputs.append(infer_input)
 

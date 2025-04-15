@@ -1,7 +1,11 @@
+import os
 import torch
 from torch.ao.nn.quantized import FloatFunctional
 from torch.ao.quantization import QuantStub, DeQuantStub
 from ultralytics.utils.tal import dist2bbox, make_anchors
+
+BACKEND = "qnnpack"
+WORLD_SIZE = os.environ.get("WORLD_SIZE", 1)
 
 def bottleneck_quant_forward(self, x):
     return self.ffn.add(x , self.cv2(self.cv1(x))) if self.add else self.cv2(self.cv1(x))

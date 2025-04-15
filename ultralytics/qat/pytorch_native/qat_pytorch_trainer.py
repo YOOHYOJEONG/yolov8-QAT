@@ -1,34 +1,29 @@
 from torch.ao.quantization import QuantStub, DeQuantStub, prepare_qat, get_default_qat_qconfig, convert, disable_observer, fuse_modules_qat
 from torch.nn.intrinsic.qat import freeze_bn_stats
 
+import time
 import math
-import torch 
-import torch.nn as nn
-import warnings
-from torch import distributed as dist
-from ultralytics.models.yolo.detect.train import DetectionTrainer
-from ultralytics.nn.tasks import DetectionModel, BaseModel, v8DetectionLoss,parse_model, yaml_model_load
-from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK,  __version__,  callbacks
-from ultralytics.utils.torch_utils import  ModelEMA, initialize_weights, scale_img
-from ultralytics.nn.modules.conv import Conv
-from ultralytics.nn.modules.head import Detect, Segment, Pose
-from torch import nn, optim
-from ultralytics.utils.autobatch import check_train_batch_size
-from ultralytics.utils.checks import check_amp, check_imgsz
-from ultralytics.utils.torch_utils import EarlyStopping, ModelEMA
-from .quant_pytorch_ops import quant_module_change
-import torch.distributed as dist
-from datetime import datetime
 import numpy as np
 from copy import deepcopy
-import os
-import time
-from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, TQDM, __version__, callbacks, colorstr, emojis
+import warnings
+from datetime import datetime
 
-# from ultralytics.data.build import collate_fn
+import torch 
+import torch.nn as nn
+from torch import nn, optim
+from torch import distributed as dist
 
-BACKEND = "qnnpack"
-WORLD_SIZE = os.environ.get("WORLD_SIZE", 1)
+from ultralytics.models.yolo.detect.train import DetectionTrainer
+from ultralytics.nn.tasks import DetectionModel, BaseModel, v8DetectionLoss,parse_model, yaml_model_load, attempt_load_weights
+from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, __version__, callbacks, TQDM, colorstr, emojis
+from ultralytics.utils.torch_utils import  EarlyStopping, ModelEMA, initialize_weights, scale_img
+from ultralytics.nn.modules.conv import Conv
+from ultralytics.nn.modules.head import Detect, Segment, Pose
+from ultralytics.utils.autobatch import check_train_batch_size
+from ultralytics.utils.checks import check_amp, check_imgsz
+
+from ultralytics.qat.pytorch_native.quant_pytorch_ops import quant_module_change, BACKEND, WORLD_SIZE
+
 
 def convert2qat(model):
     _model = deepcopy(model).to("cpu").eval()
@@ -90,7 +85,7 @@ class QuantYolo(BaseModel):
             self.info()
             LOGGER.info('')
 
-    def _predict_once(self, x, profile=False, visualize=False):
+    def _predict_once(self, x, profile=False, visualize=False, embed=None):
         """
         Perform a forward pass through the network.
 
@@ -169,8 +164,8 @@ class PytorchQuantizationTrainer(DetectionTrainer):
         """Reset arguments when loading a PyTorch model."""
         include = {'imgsz', 'data', 'task', 'single_cls'}  # only remember these arguments when loading a PyTorch model
         return {k: v for k, v in args.items() if k in include}
-    
-    def get_model(self, cfg=None, weights=None, verbose=True, backend = BACKEND):
+       
+    def get_model(self, cfg=None, weights=None, verbose=True, backend=BACKEND):
         """_summary_
 
         Args:
@@ -181,39 +176,36 @@ class PytorchQuantizationTrainer(DetectionTrainer):
         Returns:
             _type_: _description_
         """
-        # if RANK in (-1, 0):
-        #     self.test_loader = self.get_dataloader(self.testset, batch_size=16 * 2, rank=-1, mode='val')
         Conv.default_act = nn.ReLU()
         self.model_cfg = cfg
         model = QuantYolo(cfg = cfg, ch = 3, nc=  self.data['nc'], verbose = False)
-        # model.load_state_dict(torch.load(weights)['model'].state_dict())
-        print(f"➰ Loading weights from: {weights}")
-        # model.load_state_dict(torch.load(weights)['model'].state_dict(), strict=False)
+        # model.load_state_dict(torch.load(weights)['model'].state_dict())  # 기존 코드
+        if weights:
+            print(f"➰ Loading weights from: {weights}")
+            pretrained = attempt_load_weights(weights, device="cpu", inplace=False)
+            pretrained_dict = pretrained.state_dict()
+            model_dict = model.state_dict()
 
-        ckpt = torch.load(weights, map_location='cpu')
-        pretrained_dict = ckpt['model'].state_dict()
-        model_dict = model.state_dict()
+            # shape 맞는 것만 골라서 로드
+            filtered_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
+            skipped = [k for k in pretrained_dict if k not in filtered_dict]
+            if skipped:
+                print(f"⚠️ Skipped loading {len(skipped)} mismatched layers: {skipped[:3]}...")
 
-        # shape 맞는 것만 골라서 로드
-        filtered_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
-
-        # 스킵 된 레이어들
-        mismatched = [k for k in pretrained_dict.keys() if k not in filtered_dict]
-        if mismatched:
-            # 무시 된 레이어들의 개수 출력
-            print(f"⚠️  Skipped loading {len(mismatched)} layers due to shape mismatch")
-
-        model_dict.update(filtered_dict)
-        model.load_state_dict(model_dict, strict=False)
+            model_dict.update(filtered_dict)
+            model.load_state_dict(model_dict, strict=False)
 
         # quant_module_change(model)
         model.fuse_model()
         model.qconfig = get_default_qat_qconfig(backend)
         model.backend = backend
         prepare_qat(model, inplace = True)
+
+        # QAT 후 변환 테스트 (이건 실제 학습 모델 아님, 그냥 변환 테스트)
         quantized_model = convert(model.to("cpu").eval(), inplace=False)
         quantized_model.eval()
         quantized_model(torch.randn(1,3,640,640, dtype=torch.float))
+
         print(f"Using QConfig for {backend} backend")
 
         return model
@@ -238,15 +230,6 @@ class PytorchQuantizationTrainer(DetectionTrainer):
 
         ckpt = self.setup_model()
         self.model = self.model.to(self.device)
-        # if self.args.rank != -1:
-        #     self.model = torch.nn.parallel.DistributedDataParallel(
-        #         self.model.cuda(),
-        #         device_ids=[self.args.local_rank],
-        #         output_device=self.args.local_rank,
-        #         find_unused_parameters=True,
-        #     )
-        # else:
-        #     self.model = self.model.to(self.device)
 
         self.set_model_attributes()
 
@@ -289,24 +272,6 @@ class PytorchQuantizationTrainer(DetectionTrainer):
         # Dataloaders
         batch_size = self.batch_size // max(world_size, 1)
         self.train_loader = self.get_dataloader(self.trainset, batch_size=batch_size, rank=RANK, mode='train')
-        
-        # if self.args.rank != -1:
-        #     self.train_sampler = torch.utils.data.distributed.DistributedSampler(self.trainset)
-        # else:
-        #     self.train_sampler = None
-
-        # print("👉 trainset sample:", self.trainset[0])
-
-        # self.train_loader = torch.utils.data.DataLoader(
-        #     self.trainset,
-        #     batch_size=batch_size,
-        #     shuffle=(self.train_sampler is None),  # DDP면 False
-        #     sampler=self.train_sampler,
-        #     num_workers=4,
-        #     pin_memory=True,
-        #     drop_last=True,
-        #     collate_fn=getattr(self.trainset, 'collate_fn', None),
-        # )
 
         if RANK in (-1, 0):
             self.test_loader = self.get_dataloader(self.testset, batch_size=batch_size * 2, rank=-1, mode='val')
@@ -335,7 +300,7 @@ class PytorchQuantizationTrainer(DetectionTrainer):
         self.scheduler.last_epoch = self.start_epoch - 1  # do not move
         self.run_callbacks('on_pretrain_routine_end')
 
-    def _do_train(self, world_size = WORLD_SIZE):
+    def _do_train(self, world_size=WORLD_SIZE):
         """Train completed, evaluate and plot if specified by arguments."""
         if world_size > 1:
             self._setup_ddp(world_size)
@@ -358,8 +323,6 @@ class PytorchQuantizationTrainer(DetectionTrainer):
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
         epoch = self.epochs  # predefine for resume fully trained model edge cases
         for epoch in range(self.start_epoch, self.epochs):
-            # if hasattr(self, 'train_sampler') and self.train_sampler is not None:
-            #     self.train_sampler.set_epoch(epoch)
             self.epoch = epoch
             if epoch > 3:
                 # Freeze batch norm mean and variance estimates
