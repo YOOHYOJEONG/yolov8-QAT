@@ -23,9 +23,13 @@ import numpy as np
 from copy import deepcopy
 import os
 import time
-from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, TQDM, __version__, callbacks,  colorstr, emojis
+from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, TQDM, __version__, callbacks, colorstr, emojis
+
+# from ultralytics.data.build import collate_fn
+
 BACKEND = "qnnpack"
 WORLD_SIZE = os.environ.get("WORLD_SIZE", 1)
+
 def convert2qat(model):
     _model = deepcopy(model).to("cpu").eval()
     #_model.apply(disable_observer)
@@ -182,7 +186,26 @@ class PytorchQuantizationTrainer(DetectionTrainer):
         Conv.default_act = nn.ReLU()
         self.model_cfg = cfg
         model = QuantYolo(cfg = cfg, ch = 3, nc=  self.data['nc'], verbose = False)
-        model.load_state_dict(torch.load(weights)['model'].state_dict())
+        # model.load_state_dict(torch.load(weights)['model'].state_dict())
+        print(f"➰ Loading weights from: {weights}")
+        # model.load_state_dict(torch.load(weights)['model'].state_dict(), strict=False)
+
+        ckpt = torch.load(weights, map_location='cpu')
+        pretrained_dict = ckpt['model'].state_dict()
+        model_dict = model.state_dict()
+
+        # shape 맞는 것만 골라서 로드
+        filtered_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
+
+        # 스킵 된 레이어들
+        mismatched = [k for k in pretrained_dict.keys() if k not in filtered_dict]
+        if mismatched:
+            # 무시 된 레이어들의 개수 출력
+            print(f"⚠️  Skipped loading {len(mismatched)} layers due to shape mismatch")
+
+        model_dict.update(filtered_dict)
+        model.load_state_dict(model_dict, strict=False)
+
         # quant_module_change(model)
         model.fuse_model()
         model.qconfig = get_default_qat_qconfig(backend)
@@ -215,6 +238,16 @@ class PytorchQuantizationTrainer(DetectionTrainer):
 
         ckpt = self.setup_model()
         self.model = self.model.to(self.device)
+        # if self.args.rank != -1:
+        #     self.model = torch.nn.parallel.DistributedDataParallel(
+        #         self.model.cuda(),
+        #         device_ids=[self.args.local_rank],
+        #         output_device=self.args.local_rank,
+        #         find_unused_parameters=True,
+        #     )
+        # else:
+        #     self.model = self.model.to(self.device)
+
         self.set_model_attributes()
 
         # Freeze layers
@@ -256,6 +289,25 @@ class PytorchQuantizationTrainer(DetectionTrainer):
         # Dataloaders
         batch_size = self.batch_size // max(world_size, 1)
         self.train_loader = self.get_dataloader(self.trainset, batch_size=batch_size, rank=RANK, mode='train')
+        
+        # if self.args.rank != -1:
+        #     self.train_sampler = torch.utils.data.distributed.DistributedSampler(self.trainset)
+        # else:
+        #     self.train_sampler = None
+
+        # print("👉 trainset sample:", self.trainset[0])
+
+        # self.train_loader = torch.utils.data.DataLoader(
+        #     self.trainset,
+        #     batch_size=batch_size,
+        #     shuffle=(self.train_sampler is None),  # DDP면 False
+        #     sampler=self.train_sampler,
+        #     num_workers=4,
+        #     pin_memory=True,
+        #     drop_last=True,
+        #     collate_fn=getattr(self.trainset, 'collate_fn', None),
+        # )
+
         if RANK in (-1, 0):
             self.test_loader = self.get_dataloader(self.testset, batch_size=batch_size * 2, rank=-1, mode='val')
             self.validator = self.get_validator()
@@ -306,6 +358,8 @@ class PytorchQuantizationTrainer(DetectionTrainer):
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
         epoch = self.epochs  # predefine for resume fully trained model edge cases
         for epoch in range(self.start_epoch, self.epochs):
+            # if hasattr(self, 'train_sampler') and self.train_sampler is not None:
+            #     self.train_sampler.set_epoch(epoch)
             self.epoch = epoch
             if epoch > 3:
                 # Freeze batch norm mean and variance estimates
