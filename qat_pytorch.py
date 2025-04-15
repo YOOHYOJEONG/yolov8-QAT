@@ -2,8 +2,6 @@ import os
 import sys
 import argparse
 import subprocess
-import inspect
-import tempfile
 import textwrap
 import json
 import socket
@@ -104,10 +102,13 @@ def train(args):
         'cfg': args.model_config,
         'model': args.pretrained_weight,
         'data': args.data_config,
+        'imgsz': args.imgsz,
         'epochs': args.epochs,
         'device': args.device,
         'batch': args.batch,
         'quant_backend': args.quant_backend,
+        'project': args.project,
+        'name': args.name,
     }
 
     # Construct trainer
@@ -135,9 +136,12 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained_weight", type=str, default='yolov8s.pt')
     parser.add_argument("--data_config", type=str, default='coco.yaml')
     parser.add_argument("--quant_backend", type=str, default='qnnpack')
+    parser.add_argument("--imgsz", type=int, default=640, help="input images size as int for train and val modes, or list[h,w] for predict and export modes")
     parser.add_argument('--epochs', type=int, default=100, help="Number of training epochs")
     parser.add_argument("--device", default="0", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
-    parser.add_argument('--batch', type=int, default=8, help="Batch-size for QAT.")
+    parser.add_argument('--batch', type=int, default=4, help="Batch-size for QAT")
+    parser.add_argument('--project', type=str, default="runs/train/yolov8", help="project name")
+    parser.add_argument('--name', type=str, default="test", help="experiment name, results saved to 'project/name' directory")
     args = parser.parse_args()
 
     train(args)
