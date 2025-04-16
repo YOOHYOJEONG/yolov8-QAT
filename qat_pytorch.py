@@ -53,7 +53,7 @@ def generate_ddp_file(trainer, overrides):
         from ultralytics.nn.modules.head import Detect, Segment, Pose
         from ultralytics.utils.autobatch import check_train_batch_size
         from ultralytics.utils.checks import check_amp, check_imgsz
-        from ultralytics.qat.pytorch_native.qat_pytorch_trainer import QuantYolo
+        from ultralytics.qat.pytorch_native.qat_pytorch_trainer import QuantYolo, load_quantized_model
 
         from ultralytics.qat.pytorch_native.quant_pytorch_ops import quant_module_change, BACKEND, WORLD_SIZE
     """)
