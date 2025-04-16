@@ -26,6 +26,28 @@ from ultralytics.utils.checks import check_amp, check_imgsz
 from ultralytics.qat.pytorch_native.quant_pytorch_ops import quant_module_change, BACKEND, WORLD_SIZE
 
 
+# QAT 후 convert()된 모델을 validator와 호환되도록 감싸는 래퍼 클래스
+class QATWrappedModel(nn.Module):
+    def __init__(self, quant_model, names, stride):
+        super().__init__()
+        self.model = quant_model
+        self.names = names
+        self.stride = torch.tensor([stride])
+        self.pt = False
+        self.amp = False
+        self.nc = len(names)
+        self.end2end = False
+
+    def forward(self, x, augment=False, visualize=False, embed=None):
+        return self.model(x)
+
+    def loss(self, batch, preds):
+        # validator에서 loss 계산을 위해 필요하므로 더미 리턴
+        return torch.tensor(0.0), torch.zeros(3, device=preds.device)
+    
+    def fuse(self, verbose=False):  # validator(AutoBackend)가 호출하는 함수
+        return self
+
 def convert2qat(model):
     _model = deepcopy(model).to("cpu").eval()
     #_model.apply(disable_observer)
@@ -43,12 +65,16 @@ def load_quantized_model(path, cfg, nc):
     model.fuse_model()
     model.qconfig = get_default_qat_qconfig(dicts['backend'])
     prepare_qat(model, inplace =True)
-    convert(model, inplace=True)
-    #quant_module_change(model)
-    model.load_state_dict(dicts['model'])
-    print("load complete")
-    return model
 
+    # Load weights before convert
+    model.load_state_dict(dicts['model'], strict=False)
+    quantized_model = convert(model, inplace=False)
+    quantized_model.eval()
+
+    print("✅ Quantized model successfully loaded and converted.")
+    wrapped_model = QATWrappedModel(quantized_model, model.names, stride=torch.tensor([32]))
+    
+    return wrapped_model
 
 class QuantYolo(BaseModel):
     def __init__(self, cfg='yolov8n.yaml', ch=3, nc=None, verbose=False):  # model, input channels, number of classes
@@ -180,7 +206,6 @@ class PytorchQuantizationTrainer(DetectionTrainer):
         Conv.default_act = nn.ReLU()
         self.model_cfg = cfg
         model = QuantYolo(cfg = cfg, ch = 3, nc=  self.data['nc'], verbose = False)
-        # model.load_state_dict(torch.load(weights)['model'].state_dict())  # 기존 코드
         if weights:
             print(f"➰ Loading weights from: {weights}")
             pretrained = attempt_load_weights(weights, device="cpu", inplace=False)
@@ -502,10 +527,24 @@ class PytorchQuantizationTrainer(DetectionTrainer):
         for f in self.last, self.best:
             if f.exists():
                 model = load_quantized_model(f, self.model_cfg, self.data['nc'])
+
+                # DDP 감싸진 모델이면 unwrap
+                if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+                    model = model.module
+
+                # quantized model은 CPU에서만 실행되어야 함
+                model.to("cpu")
+                model.eval()
+
                  # strip optimizers
                 if f is self.best:
                     LOGGER.info(f'\nValidating {f}...')
+                    self.validator.qat = self.qat     # 추가한 코드
                     self.validator.args.plots = self.args.plots
-                    self.metrics = self.validator(model=model, qat = self.qat)
+                    self.validator.args.verbose = True  # 클래스별 metric 출력 설정
+                    # validator가 GPU로 올리지 않도록 강제
+                    if hasattr(self.validator, "device"):     # 추가한 코드
+                        self.validator.device = torch.device("cpu")
+                    self.metrics = self.validator(trainer=self, model=model)
                     self.metrics.pop('fitness', None)
                     self.run_callbacks('on_fit_epoch_end')

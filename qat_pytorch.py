@@ -17,11 +17,10 @@ def find_free_network_port():
         return s.getsockname()[1]
 
 
-def generate_ddp_file(trainer, overrides):
+def generate_ddp_file(overrides):
     import inspect
     import tempfile
 
-    code = inspect.getsource(trainer.__class__)
     temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
     
     overrides_json = json.dumps(overrides)
@@ -53,7 +52,7 @@ def generate_ddp_file(trainer, overrides):
         from ultralytics.nn.modules.head import Detect, Segment, Pose
         from ultralytics.utils.autobatch import check_train_batch_size
         from ultralytics.utils.checks import check_amp, check_imgsz
-        from ultralytics.qat.pytorch_native.qat_pytorch_trainer import QuantYolo, load_quantized_model
+        from ultralytics.qat.pytorch_native.qat_pytorch_trainer import QuantYolo, QATWrappedModel, load_quantized_model
 
         from ultralytics.qat.pytorch_native.quant_pytorch_ops import quant_module_change, BACKEND, WORLD_SIZE
     """)
@@ -68,13 +67,13 @@ def generate_ddp_file(trainer, overrides):
             trainer.train()
     """)
 
-    temp_file.write(helper_definitions + "\n" + code + "\n" + runner_code)
+    temp_file.write(helper_definitions + "\n" + runner_code)
     temp_file.close()
     return temp_file.name
 
 
-def generate_ddp_command(world_size, trainer, overrides):
-    file = generate_ddp_file(trainer, overrides)
+def generate_ddp_command(world_size, overrides):
+    file = generate_ddp_file(overrides)
     port = find_free_network_port()
     cmd = [
         sys.executable, "-m", "torch.distributed.run",
@@ -111,23 +110,13 @@ def train(args):
         'name': args.name,
     }
 
-    # Construct trainer
-    trainer = PytorchQuantizationTrainer(cfg=DEFAULT_CFG, overrides=overrides)
-
-    trainer.model = trainer.get_model(cfg=args.model_config,
-                                      weights=args.pretrained_weight,
-                                      backend=args.quant_backend)
-
     # If DDP and not already inside torchrun
     if world_size > 1 and 'LOCAL_RANK' not in os.environ:
-        cmd, temp_file = generate_ddp_command(world_size, trainer, overrides)
+        cmd, temp_file = generate_ddp_command(world_size, overrides)
         LOGGER.info(f"{colorstr('DDP:')} launching distributed training via: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
         ddp_cleanup(temp_file)
         return
-
-    # Otherwise: single GPU or already inside DDP
-    trainer.train()
 
 
 if __name__ == "__main__":
@@ -137,7 +126,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_config", type=str, default='coco.yaml')
     parser.add_argument("--quant_backend", type=str, default='qnnpack')
     parser.add_argument("--imgsz", type=int, default=640, help="input images size as int for train and val modes, or list[h,w] for predict and export modes")
-    parser.add_argument('--epochs', type=int, default=100, help="Number of training epochs")
+    parser.add_argument('--epochs', type=int, default=100, help="Number of training epochs, It must always be a multiple of 10")
     parser.add_argument("--device", default="0", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
     parser.add_argument('--batch', type=int, default=4, help="Batch-size for QAT")
     parser.add_argument('--project', type=str, default="runs/train/yolov8", help="project name")
