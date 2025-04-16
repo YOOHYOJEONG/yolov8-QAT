@@ -3,6 +3,7 @@ from torch.nn.intrinsic.qat import freeze_bn_stats
 
 import time
 import math
+import copy
 import numpy as np
 from copy import deepcopy
 import warnings
@@ -412,8 +413,9 @@ class PytorchQuantizationTrainer(DetectionTrainer):
 
                 # Save model
                 if self.args.save or final_epoch:
-                    self.save_model()
-                    self.run_callbacks('on_model_save')
+                    if RANK in (-1, 0):
+                        self.save_model()
+                        self.run_callbacks('on_model_save')
 
             # Scheduler
             t = time.time()
@@ -453,10 +455,24 @@ class PytorchQuantizationTrainer(DetectionTrainer):
     def save_model(self):
         """Save model training checkpoints with additional metadata."""
         import pandas as pd  # scope for faster startup
-        quantized_model = convert(self.model.to("cpu").eval(), inplace=False)
+        
+        # 1. 순수 QuantYolo 모델 새로 생성 (DDP와 무관)
+        pure_model = QuantYolo(cfg=self.model_cfg, ch=3, nc=self.data['nc'], verbose=False)
+        pure_model.eval()
+        pure_model.fuse_model()
+        pure_model.qconfig = get_default_qat_qconfig(getattr(self.model, 'backend', 'qnnpack'))
+        pure_model.backend = getattr(self.model, 'backend', 'qnnpack')
+
+        # 2. DDP 여부와 상관없이 state_dict만 복사
+        model_for_state = self.model.module if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) else self.model
+        pure_model.load_state_dict(model_for_state.state_dict(), strict=False)
+
+        # 3. convert()만 수행, forward()는 하지 않음
+        quantized_model = convert(pure_model.cpu(), inplace=False)
         quantized_model.eval()
-        quantized_model(torch.randn(1,3,640,640, dtype=torch.float))
-        self.model.to("cuda")
+
+        # 4. 원래 모델은 다시 GPU로 복원
+        self.model.to(self.device)
 
         metrics = {**self.metrics, **{'fitness': self.fitness}}
         results = {k.strip(): v for k, v in pd.read_csv(self.csv).to_dict(orient='list').items()}
@@ -464,7 +480,7 @@ class PytorchQuantizationTrainer(DetectionTrainer):
             'epoch': self.epoch,
             'best_fitness': self.best_fitness,
             'model': quantized_model.state_dict(),
-            'backend': self.model.backend,
+            'backend': model_for_state.backend,
             # 'ema': self.ema.ema.state_dict(),
             # 'updates': self.ema.updates,
             'optimizer': self.optimizer.state_dict(),
