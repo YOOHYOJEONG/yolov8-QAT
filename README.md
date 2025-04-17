@@ -1,34 +1,60 @@
 # YOLOv8 QAT
 
-Original Ultralytics compatible. (You can pretrain your model befor QAT as original way using this repository)
-## Usage
+   
+I've made a general fix to the old code(https://github.com/mmsori/yolov8-QAT.git) that is not compatible with the current yolov8(ultralytics) repo.   
+- Fixed an issue where class num('nc') was not overriding.   
+- Modified to enable training with multi gpu(DDP).   
+- When saving the model, I modified it to save fp32 model as well. Since the int8 model saved in the previous version can only perform CPU operations, I also save the fp32 model that can perform GPU operations.   
+- I wrote an inference code that can be inferred from the fp32 model I saved using GPU.   
+(I used the ultralytics module because it was an ultralytics base.) 
+      
 
-Install editable package in your environment by `pip install -e .`
-
-### Using pytorch native quantization API
-
+## environment
+ubuntu 22.04   
+python 3.10  
+pytorch 2.3.1   
+cuda 12.1   
+    
+## Usage   
 ```bash
-python qat_pytorch.py \
---model-config ${model_config_yaml_file} \
---pretrained-weight ${path_to_your_pretrained_weight} \
---data-config ${path_to_your_data_config_file}
+python3.10 -m venv env-qat   
+
+source env-qat/bin/activate   
+
+pip install --upgrade pip   
+
+pip install scikit-build cmake   
+
+apt-get install git -y; apt install git   
+
+apt-get install libgl1-mesa-glx -y   
+
+pip install torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121    
+
+```    
+
+Install editable package in your environment by
+```bash
+pip install -e .
 ```
-### Using `pytorch_quantization` package from nvidia
-You need to install `pytorch_quantization` package
 
+
+### Using pytorch native quantization API   
 ```bash
-python qat_nvidia.py \
---model-config ${model_config_yaml_file} \
---pretrained-weight ${path_to_your_pretrained_weight} \
---data-config ${path_to_your_data_config_file}
+python qat_pytorch.py --model_config yolov8n.yaml --pretrained_weight yolov8n.pt --data_config dataset/coco8.yaml --imgsz 640 --batch 8 --epochs 100 --device 0,1
+```    
+### Using `pytorch_quantization` package from nvidia
+You need to install `pytorch_quantization` package   
+```bash
+# TODO
 ```
 
 ## TODO
 - end-to-end export to TensorRT engine(when using pytorch_quantization)
+- yolov8 QAT using nvidia pytorch_quantization package
 - code refactoring 
-- find other ways to improve mAP after QAT
 
 ## References
-https://medium.com/@DeeperAndCheaper/quantization-yolov8-qat-x2-speed-up-on-your-jetson-orin-nano-2-how-to-achieve-the-best-qat-8077ac0a167b
+https://github.com/mmsori/yolov8-QAT   
 
-https://pytorch.org/tutorials/advanced/static_quantization_tutorial.html#quantization-aware-training
+https://pytorch.org/tutorials/advanced/static_quantization_tutorial.html#quantization-aware-training   
