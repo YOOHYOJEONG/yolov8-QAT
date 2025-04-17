@@ -16,6 +16,7 @@ pytorch 2.3.1
 cuda 12.1   
     
 ## Usage   
+### Installation
 ```bash
 python3.10 -m venv env-qat   
 
@@ -41,13 +42,25 @@ pip install -e .
 
 ### Using pytorch native quantization API   
 ```bash
-python qat_pytorch.py --model_config yolov8n.yaml --pretrained_weight yolov8n.pt --data_config dataset/coco8.yaml --imgsz 640 --batch 8 --epochs 100 --device 0,1
+python qat_pytorch.py --model_config yolov8n.yaml --pretrained_weight yolov8n.pt --data_config dataset/coco8.yaml \
+--imgsz 640 --batch 8 --epochs 100 --device 0,1
 ```    
 ### Using `pytorch_quantization` package from nvidia
 You need to install `pytorch_quantization` package   
 ```bash
 # TODO
 ```
+   
+### inference
+using CPU
+```bash
+python qat_inference_cpu.py
+```   
+
+using GPU
+```bash
+python qat_inference_gpu.py
+```   
 
 ## TODO
 - end-to-end export to TensorRT engine(when using pytorch_quantization)
