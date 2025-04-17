@@ -61,7 +61,7 @@ def load_quantized_model(path, cfg, nc):
     Conv.default_act = nn.ReLU()
     dicts = torch.load(path, map_location='cpu')
 
-    model = QuantYolo(cfg = cfg, ch = 3, nc=  nc, verbose = False)
+    model = QuantYolo(cfg = cfg, ch = 3, nc = nc, verbose = False)
     model.fuse_model()
     model.qconfig = get_default_qat_qconfig(dicts['backend'])
     prepare_qat(model, inplace =True)
@@ -205,7 +205,7 @@ class PytorchQuantizationTrainer(DetectionTrainer):
         """
         Conv.default_act = nn.ReLU()
         self.model_cfg = cfg
-        model = QuantYolo(cfg = cfg, ch = 3, nc=  self.data['nc'], verbose = False)
+        model = QuantYolo(cfg = cfg, ch = 3, nc = self.data['nc'], verbose = False)
         if weights:
             print(f"➰ Loading weights from: {weights}")
             pretrained = attempt_load_weights(weights, device="cpu", inplace=False)
@@ -501,10 +501,25 @@ class PytorchQuantizationTrainer(DetectionTrainer):
 
         metrics = {**self.metrics, **{'fitness': self.fitness}}
         results = {k.strip(): v for k, v in pd.read_csv(self.csv).to_dict(orient='list').items()}
-        ckpt = {
+        
+        ckpt_int8 = {
             'epoch': self.epoch,
             'best_fitness': self.best_fitness,
-            'model': quantized_model.state_dict(),
+            'model': quantized_model.state_dict(),   # qat int8 model save
+            'backend': model_for_state.backend,
+            # 'ema': self.ema.ema.state_dict(),
+            # 'updates': self.ema.updates,
+            'optimizer': self.optimizer.state_dict(),
+            'train_args': vars(self.args),  # save as dict
+            'train_metrics': metrics,
+            'train_results': results,
+            'date': datetime.now().isoformat(),
+            'version': __version__}
+        
+        ckpt_fp32 = {
+            'epoch': self.epoch,
+            'best_fitness': self.best_fitness,
+            'model': model_for_state.state_dict(),   # qat fp32 model save
             'backend': model_for_state.backend,
             # 'ema': self.ema.ema.state_dict(),
             # 'updates': self.ema.updates,
@@ -516,35 +531,36 @@ class PytorchQuantizationTrainer(DetectionTrainer):
             'version': __version__}
 
         # Save last and best
-        torch.save(ckpt, self.last)
+        torch.save(ckpt_int8, self.wdir / 'last_int8.pt')
+        torch.save(ckpt_fp32, self.wdir / 'last_fp32.pt')
         if self.best_fitness == self.fitness:
-            torch.save(ckpt, self.best)
+            torch.save(ckpt_fp32, self.wdir / 'best_fp32.pt')
+            torch.save(ckpt_int8, self.wdir / 'best_int8.pt')
         if (self.save_period > 0) and (self.epoch > 0) and (self.epoch % self.save_period == 0):
-            torch.save(ckpt, self.wdir / f'epoch{self.epoch}.pt')
+            torch.save(ckpt_int8, self.wdir / f'epoch{self.epoch}_ing8.pt')
+            torch.save(ckpt_fp32, self.wdir / f'epoch{self.epoch}_fp32.pt')
 
     def final_eval(self):
         """Performs final evaluation and validation for object detection YOLO model."""
-        for f in self.last, self.best:
-            if f.exists():
-                model = load_quantized_model(f, self.model_cfg, self.data['nc'])
+        best_ = self.wdir / 'best_int8.pt'
+        model = load_quantized_model(best_, self.model_cfg, self.data['nc'])
 
-                # DDP 감싸진 모델이면 unwrap
-                if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                    model = model.module
+        # DDP 감싸진 모델이면 unwrap
+        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            model = model.module
 
-                # quantized model은 CPU에서만 실행되어야 함
-                model.to("cpu")
-                model.eval()
+        # quantized model은 CPU에서만 실행되어야 함
+        model.to("cpu")
+        model.eval()
 
-                 # strip optimizers
-                if f is self.best:
-                    LOGGER.info(f'\nValidating {f}...')
-                    self.validator.qat = self.qat     # 추가한 코드
-                    self.validator.args.plots = self.args.plots
-                    self.validator.args.verbose = True  # 클래스별 metric 출력 설정
-                    # validator가 GPU로 올리지 않도록 강제
-                    if hasattr(self.validator, "device"):     # 추가한 코드
-                        self.validator.device = torch.device("cpu")
-                    self.metrics = self.validator(trainer=self, model=model)
-                    self.metrics.pop('fitness', None)
-                    self.run_callbacks('on_fit_epoch_end')
+        # strip optimizers
+        LOGGER.info(f'\nValidating {best_}...')
+        self.validator.qat = self.qat     # 추가한 코드
+        self.validator.args.plots = self.args.plots
+        self.validator.args.verbose = True  # 클래스별 metric 출력 설정
+        # validator가 GPU로 올리지 않도록 강제
+        if hasattr(self.validator, "device"):     # 추가한 코드
+            self.validator.device = torch.device("cpu")
+        self.metrics = self.validator(trainer=self, model=model)
+        self.metrics.pop('fitness', None)
+        self.run_callbacks('on_fit_epoch_end')
