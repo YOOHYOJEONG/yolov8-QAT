@@ -6,8 +6,7 @@ import textwrap
 import json
 import socket
 
-from ultralytics.utils import LOGGER, colorstr, DEFAULT_CFG
-from ultralytics.qat.pytorch_native.qat_pytorch_trainer import PytorchQuantizationTrainer
+from ultralytics.utils import LOGGER, colorstr
 
 
 def find_free_network_port():
@@ -18,7 +17,6 @@ def find_free_network_port():
 
 
 def generate_ddp_file(overrides):
-    import inspect
     import tempfile
 
     temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
