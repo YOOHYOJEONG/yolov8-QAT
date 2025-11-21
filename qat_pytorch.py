@@ -108,13 +108,26 @@ def train(args):
         'name': args.name,
     }
 
-    # If DDP and not already inside torchrun
+    # DDP
     if world_size > 1 and 'LOCAL_RANK' not in os.environ:
         cmd, temp_file = generate_ddp_command(world_size, overrides)
         LOGGER.info(f"{colorstr('DDP:')} launching distributed training via: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
         ddp_cleanup(temp_file)
         return
+
+    # single gpu
+    from ultralytics.qat.pytorch_native.qat_pytorch_trainer import PytorchQuantizationTrainer
+    from ultralytics.utils import DEFAULT_CFG
+
+    print("Starting QAT training on single GPU/CPU...")
+    trainer = PytorchQuantizationTrainer(cfg=DEFAULT_CFG, overrides=overrides)
+    trainer.model = trainer.get_model(
+        cfg=overrides['cfg'],
+        weights=overrides['model'],
+        backend=overrides['quant_backend']
+    )
+    trainer.train()
 
 
 if __name__ == "__main__":
