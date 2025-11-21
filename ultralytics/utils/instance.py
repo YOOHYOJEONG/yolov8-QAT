@@ -1,4 +1,4 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 from collections import abc
 from itertools import repeat
@@ -14,7 +14,7 @@ def _ntuple(n):
     """From PyTorch internals."""
 
     def parse(x):
-        """Parse bounding boxes format between XYWH and LTWH."""
+        """Parse input to return n-tuple by repeating singleton values n times."""
         return x if isinstance(x, abc.Iterable) else tuple(repeat(x, n))
 
     return parse
@@ -26,9 +26,9 @@ to_4tuple = _ntuple(4)
 # `xyxy` means left top and right bottom
 # `xywh` means center x, center y and width, height(YOLO format)
 # `ltwh` means left top and width, height(COCO format)
-_formats = ['xyxy', 'xywh', 'ltwh']
+_formats = ["xyxy", "xywh", "ltwh"]
 
-__all__ = 'Bboxes',  # tuple or list
+__all__ = ("Bboxes", "Instances")  # tuple or list
 
 
 class Bboxes:
@@ -39,16 +39,22 @@ class Bboxes:
     Bounding box data should be provided in numpy arrays.
 
     Attributes:
-        bboxes (numpy.ndarray): The bounding boxes stored in a 2D numpy array.
+        bboxes (np.ndarray): The bounding boxes stored in a 2D numpy array with shape (N, 4).
         format (str): The format of the bounding boxes ('xyxy', 'xywh', or 'ltwh').
 
     Note:
         This class does not handle normalization or denormalization of bounding boxes.
     """
 
-    def __init__(self, bboxes, format='xyxy') -> None:
-        """Initializes the Bboxes class with bounding box data in a specified format."""
-        assert format in _formats, f'Invalid bounding box format: {format}, format must be one of {_formats}'
+    def __init__(self, bboxes, format="xyxy") -> None:
+        """
+        Initialize the Bboxes class with bounding box data in a specified format.
+
+        Args:
+            bboxes (np.ndarray): Array of bounding boxes with shape (N, 4) or (4,).
+            format (str): Format of the bounding boxes, one of 'xyxy', 'xywh', or 'ltwh'.
+        """
+        assert format in _formats, f"Invalid bounding box format: {format}, format must be one of {_formats}"
         bboxes = bboxes[None, :] if bboxes.ndim == 1 else bboxes
         assert bboxes.ndim == 2
         assert bboxes.shape[1] == 4
@@ -57,23 +63,31 @@ class Bboxes:
         # self.normalized = normalized
 
     def convert(self, format):
-        """Converts bounding box format from one type to another."""
-        assert format in _formats, f'Invalid bounding box format: {format}, format must be one of {_formats}'
+        """
+        Convert bounding box format from one type to another.
+
+        Args:
+            format (str): Target format for conversion, one of 'xyxy', 'xywh', or 'ltwh'.
+        """
+        assert format in _formats, f"Invalid bounding box format: {format}, format must be one of {_formats}"
         if self.format == format:
             return
-        elif self.format == 'xyxy':
-            func = xyxy2xywh if format == 'xywh' else xyxy2ltwh
-        elif self.format == 'xywh':
-            func = xywh2xyxy if format == 'xyxy' else xywh2ltwh
+        elif self.format == "xyxy":
+            func = xyxy2xywh if format == "xywh" else xyxy2ltwh
+        elif self.format == "xywh":
+            func = xywh2xyxy if format == "xyxy" else xywh2ltwh
         else:
-            func = ltwh2xyxy if format == 'xyxy' else ltwh2xywh
+            func = ltwh2xyxy if format == "xyxy" else ltwh2xywh
         self.bboxes = func(self.bboxes)
         self.format = format
 
     def areas(self):
         """Return box areas."""
-        self.convert('xyxy')
-        return (self.bboxes[:, 2] - self.bboxes[:, 0]) * (self.bboxes[:, 3] - self.bboxes[:, 1])
+        return (
+            (self.bboxes[:, 2] - self.bboxes[:, 0]) * (self.bboxes[:, 3] - self.bboxes[:, 1])  # format xyxy
+            if self.format == "xyxy"
+            else self.bboxes[:, 3] * self.bboxes[:, 2]  # format xywh or ltwh
+        )
 
     # def denormalize(self, w, h):
     #    if not self.normalized:
@@ -93,8 +107,11 @@ class Bboxes:
 
     def mul(self, scale):
         """
+        Multiply bounding box coordinates by scale factor(s).
+
         Args:
-            scale (tuple | list | int): the scale for four coords.
+            scale (int | tuple | list): Scale factor(s) for four coordinates.
+                If int, the same scale is applied to all coordinates.
         """
         if isinstance(scale, Number):
             scale = to_4tuple(scale)
@@ -107,8 +124,11 @@ class Bboxes:
 
     def add(self, offset):
         """
+        Add offset to bounding box coordinates.
+
         Args:
-            offset (tuple | list | int): the offset for four coords.
+            offset (int | tuple | list): Offset(s) for four coordinates.
+                If int, the same offset is applied to all coordinates.
         """
         if isinstance(offset, Number):
             offset = to_4tuple(offset)
@@ -124,17 +144,16 @@ class Bboxes:
         return len(self.bboxes)
 
     @classmethod
-    def concatenate(cls, boxes_list: List['Bboxes'], axis=0) -> 'Bboxes':
+    def concatenate(cls, boxes_list: List["Bboxes"], axis=0) -> "Bboxes":
         """
         Concatenate a list of Bboxes objects into a single Bboxes object.
 
         Args:
             boxes_list (List[Bboxes]): A list of Bboxes objects to concatenate.
             axis (int, optional): The axis along which to concatenate the bounding boxes.
-                                   Defaults to 0.
 
         Returns:
-            Bboxes: A new Bboxes object containing the concatenated bounding boxes.
+            (Bboxes): A new Bboxes object containing the concatenated bounding boxes.
 
         Note:
             The input should be a list or tuple of Bboxes objects.
@@ -148,16 +167,16 @@ class Bboxes:
             return boxes_list[0]
         return cls(np.concatenate([b.bboxes for b in boxes_list], axis=axis))
 
-    def __getitem__(self, index) -> 'Bboxes':
+    def __getitem__(self, index) -> "Bboxes":
         """
         Retrieve a specific bounding box or a set of bounding boxes using indexing.
 
         Args:
-            index (int, slice, or np.ndarray): The index, slice, or boolean array to select
-                                               the desired bounding boxes.
+            index (int | slice | np.ndarray): The index, slice, or boolean array to select
+                                              the desired bounding boxes.
 
         Returns:
-            Bboxes: A new Bboxes object containing the selected bounding boxes.
+            (Bboxes): A new Bboxes object containing the selected bounding boxes.
 
         Raises:
             AssertionError: If the indexed bounding boxes do not form a 2-dimensional matrix.
@@ -167,9 +186,9 @@ class Bboxes:
             length as the number of bounding boxes.
         """
         if isinstance(index, int):
-            return Bboxes(self.bboxes[index].view(1, -1))
+            return Bboxes(self.bboxes[index].reshape(1, -1))
         b = self.bboxes[index]
-        assert b.ndim == 2, f'Indexing on Bboxes with {index} failed to return a matrix!'
+        assert b.ndim == 2, f"Indexing on Bboxes with {index} failed to return a matrix!"
         return Bboxes(b)
 
 
@@ -179,56 +198,54 @@ class Instances:
 
     Attributes:
         _bboxes (Bboxes): Internal object for handling bounding box operations.
-        keypoints (ndarray): keypoints(x, y, visible) with shape [N, 17, 3]. Default is None.
+        keypoints (np.ndarray): Keypoints with shape (N, 17, 3) in format (x, y, visible).
         normalized (bool): Flag indicating whether the bounding box coordinates are normalized.
-        segments (ndarray): Segments array with shape [N, 1000, 2] after resampling.
+        segments (np.ndarray): Segments array with shape (N, M, 2) after resampling.
 
-    Args:
-        bboxes (ndarray): An array of bounding boxes with shape [N, 4].
-        segments (list | ndarray, optional): A list or array of object segments. Default is None.
-        keypoints (ndarray, optional): An array of keypoints with shape [N, 17, 3]. Default is None.
-        bbox_format (str, optional): The format of bounding boxes ('xywh' or 'xyxy'). Default is 'xywh'.
-        normalized (bool, optional): Whether the bounding box coordinates are normalized. Default is True.
+    Methods:
+        convert_bbox: Convert bounding box format.
+        scale: Scale coordinates by given factors.
+        denormalize: Convert normalized coordinates to absolute coordinates.
+        normalize: Convert absolute coordinates to normalized coordinates.
+        add_padding: Add padding to coordinates.
+        flipud: Flip coordinates vertically.
+        fliplr: Flip coordinates horizontally.
+        clip: Clip coordinates to stay within image boundaries.
+        remove_zero_area_boxes: Remove boxes with zero area.
+        update: Update instance variables.
+        concatenate: Concatenate multiple Instances objects.
 
     Examples:
-        ```python
-        # Create an Instances object
-        instances = Instances(
-            bboxes=np.array([[10, 10, 30, 30], [20, 20, 40, 40]]),
-            segments=[np.array([[5, 5], [10, 10]]), np.array([[15, 15], [20, 20]])],
-            keypoints=np.array([[[5, 5, 1], [10, 10, 1]], [[15, 15, 1], [20, 20, 1]]])
-        )
-        ```
-
-    Note:
-        The bounding box format is either 'xywh' or 'xyxy', and is determined by the `bbox_format` argument.
-        This class does not perform input validation, and it assumes the inputs are well-formed.
+        >>> instances = Instances(
+        ...     bboxes=np.array([[10, 10, 30, 30], [20, 20, 40, 40]]),
+        ...     segments=[np.array([[5, 5], [10, 10]]), np.array([[15, 15], [20, 20]])],
+        ...     keypoints=np.array([[[5, 5, 1], [10, 10, 1]], [[15, 15, 1], [20, 20, 1]]]),
+        ... )
     """
 
-    def __init__(self, bboxes, segments=None, keypoints=None, bbox_format='xywh', normalized=True) -> None:
+    def __init__(self, bboxes, segments=None, keypoints=None, bbox_format="xywh", normalized=True) -> None:
         """
+        Initialize the object with bounding boxes, segments, and keypoints.
+
         Args:
-            bboxes (ndarray): bboxes with shape [N, 4].
-            segments (list | ndarray): segments.
-            keypoints (ndarray): keypoints(x, y, visible) with shape [N, 17, 3].
+            bboxes (np.ndarray): Bounding boxes, shape (N, 4).
+            segments (List | np.ndarray, optional): Segmentation masks.
+            keypoints (np.ndarray, optional): Keypoints, shape (N, 17, 3) in format (x, y, visible).
+            bbox_format (str, optional): Format of bboxes.
+            normalized (bool, optional): Whether the coordinates are normalized.
         """
-        if segments is None:
-            segments = []
         self._bboxes = Bboxes(bboxes=bboxes, format=bbox_format)
         self.keypoints = keypoints
         self.normalized = normalized
-
-        if len(segments) > 0:
-            # List[np.array(1000, 2)] * num_samples
-            segments = resample_segments(segments)
-            # (N, 1000, 2)
-            segments = np.stack(segments, axis=0)
-        else:
-            segments = np.zeros((0, 1000, 2), dtype=np.float32)
         self.segments = segments
 
     def convert_bbox(self, format):
-        """Convert bounding box format."""
+        """
+        Convert bounding box format.
+
+        Args:
+            format (str): Target format for conversion, one of 'xyxy', 'xywh', or 'ltwh'.
+        """
         self._bboxes.convert(format=format)
 
     @property
@@ -237,7 +254,14 @@ class Instances:
         return self._bboxes.areas()
 
     def scale(self, scale_w, scale_h, bbox_only=False):
-        """This might be similar with denormalize func but without normalized sign."""
+        """
+        Scale coordinates by given factors.
+
+        Args:
+            scale_w (float): Scale factor for width.
+            scale_h (float): Scale factor for height.
+            bbox_only (bool, optional): Whether to scale only bounding boxes.
+        """
         self._bboxes.mul(scale=(scale_w, scale_h, scale_w, scale_h))
         if bbox_only:
             return
@@ -248,7 +272,13 @@ class Instances:
             self.keypoints[..., 1] *= scale_h
 
     def denormalize(self, w, h):
-        """Denormalizes boxes, segments, and keypoints from normalized coordinates."""
+        """
+        Convert normalized coordinates to absolute coordinates.
+
+        Args:
+            w (int): Image width.
+            h (int): Image height.
+        """
         if not self.normalized:
             return
         self._bboxes.mul(scale=(w, h, w, h))
@@ -260,7 +290,13 @@ class Instances:
         self.normalized = False
 
     def normalize(self, w, h):
-        """Normalize bounding boxes, segments, and keypoints to image dimensions."""
+        """
+        Convert absolute coordinates to normalized coordinates.
+
+        Args:
+            w (int): Image width.
+            h (int): Image height.
+        """
         if self.normalized:
             return
         self._bboxes.mul(scale=(1 / w, 1 / h, 1 / w, 1 / h))
@@ -272,8 +308,14 @@ class Instances:
         self.normalized = True
 
     def add_padding(self, padw, padh):
-        """Handle rect and mosaic situation."""
-        assert not self.normalized, 'you should add padding with absolute coordinates.'
+        """
+        Add padding to coordinates.
+
+        Args:
+            padw (int): Padding width.
+            padh (int): Padding height.
+        """
+        assert not self.normalized, "you should add padding with absolute coordinates."
         self._bboxes.add(offset=(padw, padh, padw, padh))
         self.segments[..., 0] += padw
         self.segments[..., 1] += padh
@@ -281,17 +323,15 @@ class Instances:
             self.keypoints[..., 0] += padw
             self.keypoints[..., 1] += padh
 
-    def __getitem__(self, index) -> 'Instances':
+    def __getitem__(self, index) -> "Instances":
         """
         Retrieve a specific instance or a set of instances using indexing.
 
         Args:
-            index (int, slice, or np.ndarray): The index, slice, or boolean array to select
-                                               the desired instances.
+            index (int | slice | np.ndarray): The index, slice, or boolean array to select the desired instances.
 
         Returns:
-            Instances: A new Instances object containing the selected bounding boxes,
-                       segments, and keypoints if present.
+            (Instances): A new Instances object containing the selected boxes, segments, and keypoints if present.
 
         Note:
             When using boolean indexing, make sure to provide a boolean array with the same
@@ -310,8 +350,13 @@ class Instances:
         )
 
     def flipud(self, h):
-        """Flips the coordinates of bounding boxes, segments, and keypoints vertically."""
-        if self._bboxes.format == 'xyxy':
+        """
+        Flip coordinates vertically.
+
+        Args:
+            h (int): Image height.
+        """
+        if self._bboxes.format == "xyxy":
             y1 = self.bboxes[:, 1].copy()
             y2 = self.bboxes[:, 3].copy()
             self.bboxes[:, 1] = h - y2
@@ -323,8 +368,13 @@ class Instances:
             self.keypoints[..., 1] = h - self.keypoints[..., 1]
 
     def fliplr(self, w):
-        """Reverses the order of the bounding boxes and segments horizontally."""
-        if self._bboxes.format == 'xyxy':
+        """
+        Flip coordinates horizontally.
+
+        Args:
+            w (int): Image width.
+        """
+        if self._bboxes.format == "xyxy":
             x1 = self.bboxes[:, 0].copy()
             x2 = self.bboxes[:, 2].copy()
             self.bboxes[:, 0] = w - x2
@@ -336,12 +386,18 @@ class Instances:
             self.keypoints[..., 0] = w - self.keypoints[..., 0]
 
     def clip(self, w, h):
-        """Clips bounding boxes, segments, and keypoints values to stay within image boundaries."""
+        """
+        Clip coordinates to stay within image boundaries.
+
+        Args:
+            w (int): Image width.
+            h (int): Image height.
+        """
         ori_format = self._bboxes.format
-        self.convert_bbox(format='xyxy')
+        self.convert_bbox(format="xyxy")
         self.bboxes[:, [0, 2]] = self.bboxes[:, [0, 2]].clip(0, w)
         self.bboxes[:, [1, 3]] = self.bboxes[:, [1, 3]].clip(0, h)
-        if ori_format != 'xyxy':
+        if ori_format != "xyxy":
             self.convert_bbox(format=ori_format)
         self.segments[..., 0] = self.segments[..., 0].clip(0, w)
         self.segments[..., 1] = self.segments[..., 1].clip(0, h)
@@ -353,7 +409,8 @@ class Instances:
         """
         Remove zero-area boxes, i.e. after clipping some boxes may have zero width or height.
 
-        This removes them.
+        Returns:
+            (np.ndarray): Boolean array indicating which boxes were kept.
         """
         good = self.bbox_areas > 0
         if not all(good):
@@ -365,7 +422,14 @@ class Instances:
         return good
 
     def update(self, bboxes, segments=None, keypoints=None):
-        """Updates instance variables."""
+        """
+        Update instance variables.
+
+        Args:
+            bboxes (np.ndarray): New bounding boxes.
+            segments (np.ndarray, optional): New segments.
+            keypoints (np.ndarray, optional): New keypoints.
+        """
         self._bboxes = Bboxes(bboxes, format=self._bboxes.format)
         if segments is not None:
             self.segments = segments
@@ -377,16 +441,16 @@ class Instances:
         return len(self.bboxes)
 
     @classmethod
-    def concatenate(cls, instances_list: List['Instances'], axis=0) -> 'Instances':
+    def concatenate(cls, instances_list: List["Instances"], axis=0) -> "Instances":
         """
-        Concatenates a list of Instances objects into a single Instances object.
+        Concatenate a list of Instances objects into a single Instances object.
 
         Args:
             instances_list (List[Instances]): A list of Instances objects to concatenate.
-            axis (int, optional): The axis along which the arrays will be concatenated. Defaults to 0.
+            axis (int, optional): The axis along which the arrays will be concatenated.
 
         Returns:
-            Instances: A new Instances object containing the concatenated bounding boxes,
+            (Instances): A new Instances object containing the concatenated bounding boxes,
                        segments, and keypoints if present.
 
         Note:
@@ -407,7 +471,20 @@ class Instances:
         normalized = instances_list[0].normalized
 
         cat_boxes = np.concatenate([ins.bboxes for ins in instances_list], axis=axis)
-        cat_segments = np.concatenate([b.segments for b in instances_list], axis=axis)
+        seg_len = [b.segments.shape[1] for b in instances_list]
+        if len(frozenset(seg_len)) > 1:  # resample segments if there's different length
+            max_len = max(seg_len)
+            cat_segments = np.concatenate(
+                [
+                    resample_segments(list(b.segments), max_len)
+                    if len(b.segments)
+                    else np.zeros((0, max_len, 2), dtype=np.float32)  # re-generating empty segments
+                    for b in instances_list
+                ],
+                axis=axis,
+            )
+        else:
+            cat_segments = np.concatenate([b.segments for b in instances_list], axis=axis)
         cat_keypoints = np.concatenate([b.keypoints for b in instances_list], axis=axis) if use_keypoint else None
         return cls(cat_boxes, cat_segments, cat_keypoints, bbox_format, normalized)
 
