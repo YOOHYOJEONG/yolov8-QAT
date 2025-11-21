@@ -4,9 +4,15 @@
 I've made a general fix to the old code(https://github.com/mmsori/yolov8-QAT.git) that is not compatible with the current yolov8(ultralytics) repo.   
 - Fixed an issue where class num('nc') was not overriding.   
 - Modified to enable training with multi gpu(DDP).   
-- When saving the model, I modified it to save fp32 model as well. Since the int8 model saved in the previous version can only perform CPU operations, I also save the fp32 model that can perform GPU operations.   
-- I wrote an inference code that can be inferred from the fp32 model I saved using GPU.   
-(I used the ultralytics module because it was an ultralytics base.) 
+- Updated model saving logic
+    - FP32 models are now saved as state_dict only.
+    - INT8 (QAT-trained) models are saved as full model objects, preserving quantized modules correctly.
+- INT8 inference workflow improved
+    - The previously saved INT8 model could not be used directly for inference.
+    - Added a conversion script that takes the saved FP32 model and converts it to an INT8 model using the QAT graph.
+    - Added an inference script that performs detection using the newly converted INT8 model.
+- Fixed several QAT-related bugs
+    - Resolved multiple issues occurring during QAT training.   
       
 
 ## environment
@@ -36,7 +42,7 @@ pip install torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 --index-url https
 
 Install editable package in your environment by
 ```bash
-pip install -e .
+pip install -r requirements.txt
 ```
 
 
@@ -45,21 +51,16 @@ pip install -e .
 python qat_pytorch.py --model_config yolov8n.yaml --pretrained_weight yolov8n.pt --data_config dataset/coco8.yaml \
 --imgsz 640 --batch 8 --epochs 100 --device 0,1
 ```    
-### Using `pytorch_quantization` package from nvidia
-You need to install `pytorch_quantization` package   
-```bash
-# TODO
-```
    
 ### inference
-using CPU
+Conversion script that takes the saved FP32 model and converts it to an INT8 model using the QAT graph.   
 ```bash
-python qat_inference_cpu.py
+python convert_fp2int.py
 ```   
-
-using GPU
+   
+Inference script that performs detection using the newly converted INT8 model.
 ```bash
-python qat_inference_gpu.py
+python inference_int8.py
 ```   
 
 ## TODO

@@ -1,13 +1,16 @@
-from torch.ao.quantization import QuantStub, DeQuantStub, prepare_qat, get_default_qat_qconfig, convert, disable_observer, fuse_modules_qat
-from torch.nn.intrinsic.qat import freeze_bn_stats
+from torch.ao.quantization import QuantStub, DeQuantStub, prepare_qat, get_default_qat_qconfig, convert, enable_observer, disable_observer, fuse_modules_qat
+from torch.ao.nn.intrinsic.qat import freeze_bn_stats
 
 import time
 import math
-import copy
-import numpy as np
-from copy import deepcopy
 import warnings
+import numpy as np
+import pandas as pd
+from copy import deepcopy
 from datetime import datetime
+import matplotlib.pyplot as plt
+from collections import defaultdict
+import gc
 
 import torch 
 import torch.nn as nn
@@ -15,8 +18,8 @@ from torch import nn, optim
 from torch import distributed as dist
 
 from ultralytics.models.yolo.detect.train import DetectionTrainer
-from ultralytics.nn.tasks import DetectionModel, BaseModel, v8DetectionLoss,parse_model, yaml_model_load, attempt_load_weights
-from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, __version__, callbacks, TQDM, colorstr, emojis
+from ultralytics.nn.tasks import DetectionModel, BaseModel, v8DetectionLoss, parse_model, yaml_model_load, attempt_load_weights
+from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, LOCAL_RANK, __version__, callbacks, TQDM, colorstr
 from ultralytics.utils.torch_utils import  EarlyStopping, ModelEMA, initialize_weights, scale_img
 from ultralytics.nn.modules.conv import Conv
 from ultralytics.nn.modules.head import Detect, Segment, Pose
@@ -32,7 +35,10 @@ class QATWrappedModel(nn.Module):
         super().__init__()
         self.model = quant_model
         self.names = names
-        self.stride = torch.tensor([stride])
+        if isinstance(stride, torch.Tensor):
+            self.stride = stride
+        else:
+            self.stride = torch.tensor([stride])
         self.pt = False
         self.amp = False
         self.nc = len(names)
@@ -48,32 +54,18 @@ class QATWrappedModel(nn.Module):
     def fuse(self, verbose=False):  # validator(AutoBackend)가 호출하는 함수
         return self
 
-def convert2qat(model):
-    _model = deepcopy(model).to("cpu").eval()
-    #_model.apply(disable_observer)
-    quantized_model = convert(_model, inplace=False)
-    quantized_model.eval()
+def replace_silu_with_relu(model):
+    for name, module in model.named_children():
+        if isinstance(module, torch.nn.SiLU):
+            setattr(model, name, torch.nn.ReLU())
+        else:
+            replace_silu_with_relu(module)
 
-    return quantized_model
-
-def load_quantized_model(path, cfg, nc):
-
-    Conv.default_act = nn.ReLU()
-    dicts = torch.load(path, map_location='cpu')
-
-    model = QuantYolo(cfg = cfg, ch = 3, nc = nc, verbose = False)
-    model.fuse_model()
-    model.qconfig = get_default_qat_qconfig(dicts['backend'])
-    prepare_qat(model, inplace =True)
-
-    # Load weights before convert
-    model.load_state_dict(dicts['model'], strict=False)
-    quantized_model = convert(model, inplace=False)
-    quantized_model.eval()
-
-    print("✅ Quantized model successfully loaded and converted.")
-    wrapped_model = QATWrappedModel(quantized_model, model.names, stride=torch.tensor([32]))
-    
+def load_quantized_model(path, *_):
+    model = torch.load(path, map_location='cpu')
+    model.eval()
+    wrapped_model = QATWrappedModel(model, getattr(model, 'names', {}), stride=getattr(model, 'stride', torch.tensor([32])))
+    print("Quantized model successfully loaded and converted.")
     return wrapped_model
 
 class QuantYolo(BaseModel):
@@ -125,6 +117,7 @@ class QuantYolo(BaseModel):
             (torch.Tensor): The last output of the model.
         """
         y, dt = [], []  # outputs
+        x = x.contiguous()  # CUDA kernel alignment 방지용
         x = self.quant(x)
         for m in self.model:
             if m.f != -1:  # if not from previous layer
@@ -152,7 +145,8 @@ class QuantYolo(BaseModel):
     def fuse_model(self):
         for m in self.modules():
             if type(m) == Conv:
-                fuse_modules_qat(m, ['conv', 'bn', 'act'], inplace=True)
+                if hasattr(m, 'bn') and m.bn is not None:
+                    fuse_modules_qat(m, ['conv', 'bn', 'act'], inplace=True)
 
     @staticmethod
     def _descale_pred(p, flips, scale, img_size, dim=1):
@@ -179,7 +173,6 @@ class QuantYolo(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         return v8DetectionLoss(self)
-    
 
 class PytorchQuantizationTrainer(DetectionTrainer):
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
@@ -193,46 +186,36 @@ class PytorchQuantizationTrainer(DetectionTrainer):
         return {k: v for k, v in args.items() if k in include}
        
     def get_model(self, cfg=None, weights=None, verbose=True, backend=BACKEND):
-        """_summary_
-
-        Args:
-            cfg (_type_, optional): Student model configuration. Defaults to None.
-            weights (_type_, optional): Student weight configuration. Defaults to None.
-            verbose (bool, optional): _description_. Defaults to True.
-
-        Returns:
-            _type_: _description_
-        """
         Conv.default_act = nn.ReLU()
         self.model_cfg = cfg
-        model = QuantYolo(cfg = cfg, ch = 3, nc = self.data['nc'], verbose = False)
+
+        # 모델 생성
+        model = QuantYolo(cfg=cfg, ch=3, nc=self.data['nc'], verbose=False)
+
+        # 가중치 로드
         if weights:
-            print(f"➰ Loading weights from: {weights}")
-            pretrained = attempt_load_weights(weights, device="cpu", inplace=False)
-            pretrained_dict = pretrained.state_dict()
-            model_dict = model.state_dict()
+            state = torch.load(weights, map_location='cpu')
+            model.load_state_dict(state['model'].state_dict(), strict=False)
 
-            # shape 맞는 것만 골라서 로드
-            filtered_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
-            skipped = [k for k in pretrained_dict if k not in filtered_dict]
-            if skipped:
-                print(f"⚠️ Skipped loading {len(skipped)} mismatched layers: {skipped[:3]}...")
+        # SiLU → ReLU 교체 (QAT 호환)
+        replace_silu_with_relu(model)
+        print("🔄 SiLU activations replaced with ReLU for QAT compatibility.")
 
-            model_dict.update(filtered_dict)
-            model.load_state_dict(model_dict, strict=False)
-
-        # quant_module_change(model)
+        # fuse
         model.fuse_model()
-        model.qconfig = get_default_qat_qconfig(backend)
-        model.backend = backend
-        prepare_qat(model, inplace = True)
 
-        # QAT 후 변환 테스트 (이건 실제 학습 모델 아님, 그냥 변환 테스트)
-        quantized_model = convert(model.to("cpu").eval(), inplace=False)
-        quantized_model.eval()
-        quantized_model(torch.randn(1,3,640,640, dtype=torch.float))
+        # QAT 설정
+        model.qconfig = get_default_qat_qconfig(backend)  # 'fbgemm'
+        prepare_qat(model, inplace=True)
 
-        print(f"Using QConfig for {backend} backend")
+        # observer warm-up (QAT 준비 직후 observer 초기화용)
+        model.train()
+        with torch.no_grad():
+            dummy = torch.randn(1, 3, 640, 640)
+            model(dummy)
+
+        num_fakequants = sum(isinstance(m, torch.ao.quantization.FakeQuantize) for m in model.modules())
+        print(f"🔍 FakeQuant modules found: {num_fakequants}")
 
         return model
     
@@ -247,11 +230,10 @@ class PytorchQuantizationTrainer(DetectionTrainer):
     def _setup_train(self, world_size):
         """Builds dataloaders and optimizer on correct rank process."""
         self.args.warmup_epochs = 0
-        self.epochs = self.epochs // 10
-        self.args.lr0 /= 50
+        self.args.lr0 /= 10
         self.args.optimizer = 'SGD'
 
-        # Model
+        # Model 준비
         self.run_callbacks('on_pretrain_routine_start')
 
         ckpt = self.setup_model()
@@ -259,7 +241,7 @@ class PytorchQuantizationTrainer(DetectionTrainer):
 
         self.set_model_attributes()
 
-        # Freeze layers
+        # Freeze layers 설정
         freeze_list = self.args.freeze if isinstance(
             self.args.freeze, list) else range(self.args.freeze) if isinstance(self.args.freeze, int) else []
         always_freeze_names = ['.dfl']  # always freeze these layers
@@ -283,7 +265,7 @@ class PytorchQuantizationTrainer(DetectionTrainer):
         if RANK > -1 and world_size > 1:  # DDP
             dist.broadcast(self.amp, src=0)  # broadcast the tensor from rank 0 to all other ranks (returns None)
         self.amp = bool(self.amp)  # as boolean
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp)
+        self.scaler = torch.amp.GradScaler(enabled=self.amp)
         if world_size > 1:
             self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK])
 
@@ -326,45 +308,66 @@ class PytorchQuantizationTrainer(DetectionTrainer):
         self.run_callbacks('on_pretrain_routine_end')
 
     def _do_train(self, world_size=WORLD_SIZE):
-        """Train completed, evaluate and plot if specified by arguments."""
+        """Main training loop for QAT."""
         if world_size > 1:
             self._setup_ddp(world_size)
         self._setup_train(world_size)
 
-        nb = len(self.train_loader)  # number of batches
-        nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1  # warmup iterations
+        nb = len(self.train_loader)
+        nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1
         last_opt_step = -1
-        self.epoch_time = None
         self.epoch_time_start = time.time()
         self.train_time_start = time.time()
         self.run_callbacks('on_train_start')
+
         LOGGER.info(f'Image sizes {self.args.imgsz} train, {self.args.imgsz} val\n'
                     f'Using {self.train_loader.num_workers * (world_size or 1)} dataloader workers\n'
                     f"Logging results to {colorstr('bold', self.save_dir)}\n"
                     f'Starting training for '
                     f'{self.args.time} hours...' if self.args.time else f'{self.epochs} epochs...')
+        
         if self.args.close_mosaic:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
+        
         epoch = self.epochs  # predefine for resume fully trained model edge cases
         for epoch in range(self.start_epoch, self.epochs):
             self.epoch = epoch
-            if epoch > 3:
-                # Freeze batch norm mean and variance estimates
+
+            # 50% 시점: Observer freeze
+            if epoch == int(self.epochs * 0.5):
+                print("Disabling observers (fix quantization scales)")
+                torch.cuda.synchronize(); torch.cuda.empty_cache()
+                self.model.apply(disable_observer)
+                gc.collect(); torch.cuda.synchronize(); torch.cuda.empty_cache()
+                self.model.to(self.device)
+                if dist.is_initialized():
+                    dist.barrier()
+
+            # 80% 시점: BN freeze
+            if epoch == int(self.epochs * 0.8):
+                print("Freezing BatchNorm running stats")
                 self.model.apply(freeze_bn_stats)
+                self.model.to(self.device)
+                if dist.is_initialized():
+                    dist.barrier()
+
+            # 에폭 시작
             self.run_callbacks('on_train_epoch_start')
             self.model.train()
             if RANK != -1:
                 self.train_loader.sampler.set_epoch(epoch)
+            nb = len(self.train_loader)
             pbar = enumerate(self.train_loader)
-            # Update dataloader attributes (optional)
+
             if epoch == (self.epochs - self.args.close_mosaic):
                 self._close_dataloader_mosaic()
                 self.train_loader.reset()
-
+            
             if RANK in (-1, 0):
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
+
             self.tloss = None
             self.optimizer.zero_grad()
             for i, batch in pbar:
@@ -382,7 +385,7 @@ class PytorchQuantizationTrainer(DetectionTrainer):
                             x['momentum'] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
 
                 # Forward
-                with torch.cuda.amp.autocast(self.amp):
+                with torch.amp.autocast(device_type='cuda', enabled=self.amp):
                     batch = self.preprocess_batch(batch)
                     self.loss, self.loss_items = self.model(batch)
                     if RANK != -1:
@@ -424,7 +427,10 @@ class PytorchQuantizationTrainer(DetectionTrainer):
 
             self.lr = {f'lr/pg{ir}': x['lr'] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
             self.run_callbacks('on_train_epoch_end')
+            
             if RANK in (-1, 0):
+                log_qat_observer_status(self.model, step=epoch)
+
                 final_epoch = epoch + 1 == self.epochs
                 # self.ema.update_attr(self.model, include=['yaml', 'nc', 'args', 'names', 'stride', 'class_weights'])
 
@@ -477,90 +483,225 @@ class PytorchQuantizationTrainer(DetectionTrainer):
         torch.cuda.empty_cache()
         self.run_callbacks('teardown')
 
+
     def save_model(self):
         """Save model training checkpoints with additional metadata."""
-        import pandas as pd  # scope for faster startup
-        
-        # 1. 순수 QuantYolo 모델 새로 생성 (DDP와 무관)
-        pure_model = QuantYolo(cfg=self.model_cfg, ch=3, nc=self.data['nc'], verbose=False)
-        pure_model.eval()
-        pure_model.fuse_model()
-        pure_model.qconfig = get_default_qat_qconfig(getattr(self.model, 'backend', 'qnnpack'))
-        pure_model.backend = getattr(self.model, 'backend', 'qnnpack')
+        # DDP unwrap
+        model_for_state = self.model.module if isinstance(self.model, nn.parallel.DistributedDataParallel) else self.model
 
-        # 2. DDP 여부와 상관없이 state_dict만 복사
-        model_for_state = self.model.module if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) else self.model
-        pure_model.load_state_dict(model_for_state.state_dict(), strict=False)
-
-        # 3. convert()만 수행, forward()는 하지 않음
-        quantized_model = convert(pure_model.cpu(), inplace=False)
-        quantized_model.eval()
-
-        # 4. 원래 모델은 다시 GPU로 복원
-        self.model.to(self.device)
-
+        # FP32(QAT-준비) state_dict 저장
         metrics = {**self.metrics, **{'fitness': self.fitness}}
         results = {k.strip(): v for k, v in pd.read_csv(self.csv).to_dict(orient='list').items()}
-        
-        ckpt_int8 = {
-            'epoch': self.epoch,
-            'best_fitness': self.best_fitness,
-            'model': quantized_model.state_dict(),   # qat int8 model save
-            'backend': model_for_state.backend,
-            # 'ema': self.ema.ema.state_dict(),
-            # 'updates': self.ema.updates,
-            'optimizer': self.optimizer.state_dict(),
-            'train_args': vars(self.args),  # save as dict
-            'train_metrics': metrics,
-            'train_results': results,
-            'date': datetime.now().isoformat(),
-            'version': __version__}
-        
+
         ckpt_fp32 = {
             'epoch': self.epoch,
             'best_fitness': self.best_fitness,
-            'model': model_for_state.state_dict(),   # qat fp32 model save
-            'backend': model_for_state.backend,
-            # 'ema': self.ema.ema.state_dict(),
-            # 'updates': self.ema.updates,
+            'model': model_for_state.state_dict(),   # QAT-준비 FP32 state_dict
             'optimizer': self.optimizer.state_dict(),
-            'train_args': vars(self.args),  # save as dict
+            'train_args': vars(self.args),
             'train_metrics': metrics,
             'train_results': results,
             'date': datetime.now().isoformat(),
-            'version': __version__}
-
-        # Save last and best
-        torch.save(ckpt_int8, self.wdir / 'last_int8.pt')
+            'version': __version__,
+        }
         torch.save(ckpt_fp32, self.wdir / 'last_fp32.pt')
+
+        # 학습 모델 deepcopy → CPU/eval → observer/BN 동결 → convert
+        q = deepcopy(model_for_state).cpu()
+
+        # observer 강제 활성화
+        q.apply(lambda m: m.enable_observer() if hasattr(m, "enable_observer") else None)
+
+        # dummy forward to convert 전 observer 스케일 보장용
+        q.train()       # observer 동작 모드로 전환
+        with torch.no_grad():
+            dummy = torch.randn(1, 3, 640, 640)
+            q(dummy)
+        q.eval()        # observer 비활성화 - 추론 모드 전환
+        q.apply(disable_observer)
+        q.apply(freeze_bn_stats)
+        q_int8 = convert(q, inplace=False).eval()     # 여기서 nn.quantized.* 구조로 변환, 양자화된 INT8 모델을 완전히 추론 모드(eval)로 고정
+
+        # INT8 모듈 자체 저장
+        torch.save(q_int8, self.wdir / 'last_int8_model.pt')
+
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # best 갱신 시 함께 저장
         if self.best_fitness == self.fitness:
             torch.save(ckpt_fp32, self.wdir / 'best_fp32.pt')
-            torch.save(ckpt_int8, self.wdir / 'best_int8.pt')
+            torch.save(q_int8, self.wdir / 'best_int8.pt')
+
         if (self.save_period > 0) and (self.epoch > 0) and (self.epoch % self.save_period == 0):
-            torch.save(ckpt_int8, self.wdir / f'epoch{self.epoch}_ing8.pt')
+            torch.save(q_int8, self.wdir / f'epoch{self.epoch}_int8.pt')
             torch.save(ckpt_fp32, self.wdir / f'epoch{self.epoch}_fp32.pt')
 
+
+    # def final_eval(self):
+    #     """Performs final evaluation and validation for object detection YOLO model."""
+    #     if dist.is_initialized() and dist.get_rank() != 0:
+    #         return    # rank0만 최종 validation 수행 (나머지 rank는 바로 종료)
+
+    #     best_ = self.wdir / 'best_int8.pt'
+    #     model = load_quantized_model(best_, self.model_cfg, self.data['nc'])
+
+    #     # DDP 감싸진 모델이면 unwrap
+    #     if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+    #         model = model.module
+
+    #     # quantized model은 CPU에서만 실행되어야 함
+    #     if hasattr(self.validator, "device"):
+    #         self.validator.device = torch.device("cpu")
+    #     model.eval()
+
+    #     for p in model.parameters():
+    #         p.requires_grad_(False)
+
+    #     # strip optimizers
+    #     LOGGER.info(f'\nValidating {best_}...')
+    #     self.validator.qat = self.qat     # 추가한 코드
+    #     self.validator.args.plots = self.args.plots
+    #     self.validator.args.verbose = True  # 클래스별 metric 출력 설정
+    #     # validator가 GPU로 올리지 않도록 강제
+    #     if hasattr(self.validator, "device"):     # 추가한 코드
+    #         self.validator.device = torch.device("cpu")
+    #     self.metrics = self.validator(trainer=self, model=model)
+    #     self.metrics.pop('fitness', None)
+    #     self.run_callbacks('on_fit_epoch_end')
+            
     def final_eval(self):
-        """Performs final evaluation and validation for object detection YOLO model."""
-        best_ = self.wdir / 'best_int8.pt'
-        model = load_quantized_model(best_, self.model_cfg, self.data['nc'])
+        """
+        Performs final evaluation and validation for object detection YOLO model
+        after QAT training.
 
-        # DDP 감싸진 모델이면 unwrap
-        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-            model = model.module
+        This version handles quantized ConvReLU2d modules safely and prevents
+        AttributeError caused by missing '_modules' in quantized layers.
+        """
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return  # rank0만 수행
 
-        # quantized model은 CPU에서만 실행되어야 함
-        model.to("cpu")
-        model.eval()
+        print("\n🚀 Starting final evaluation (Safe Mode)...")
 
-        # strip optimizers
-        LOGGER.info(f'\nValidating {best_}...')
-        self.validator.qat = self.qat     # 추가한 코드
-        self.validator.args.plots = self.args.plots
-        self.validator.args.verbose = True  # 클래스별 metric 출력 설정
-        # validator가 GPU로 올리지 않도록 강제
-        if hasattr(self.validator, "device"):     # 추가한 코드
+        # --- Load the quantized model safely ---
+        best_path = self.wdir / 'best_int8.pt'
+        if not best_path.exists():
+            LOGGER.warning(f"⚠️ {best_path} not found. Skipping final evaluation.")
+            return
+
+        # Quantized model은 이미 eval 상태로 저장되어 있으므로 추가 eval 불필요
+        model = torch.load(best_path, map_location='cpu')
+
+        # --- Safe wrapper: prevent eval/train recursion errors ---
+        class SafeQATWrappedModel(nn.Module):
+            def __init__(self, model, names, stride):
+                super().__init__()
+                self.model = model
+                self.names = names
+                self.stride = stride if isinstance(stride, torch.Tensor) else torch.tensor([stride])
+                self.nc = len(names)
+                self.pt = False
+                self.amp = False
+                self.end2end = False
+
+            def forward(self, x, *args, **kwargs):
+                return self.model(x)
+
+            def eval(self):
+                try:
+                    super().eval()
+                except AttributeError:
+                    print("⚠️ Skipping eval() on fused quantized modules (ConvReLU2d).")
+                return self
+
+            def train(self, mode=True):
+                # Quantized 모델은 학습 모드로 전환하지 않음
+                print("⚠️ Ignoring train() call for quantized model.")
+                return self
+
+            def loss(self, batch, preds):
+                return torch.tensor(0.0), torch.zeros(3, device=preds.device)
+
+            def fuse(self, verbose=False):
+                return self
+
+        # --- Wrap model safely ---
+        wrapped = SafeQATWrappedModel(
+            model,
+            getattr(model, 'names', {0: 'object'}),
+            stride=getattr(model, 'stride', torch.tensor([32]))
+        )
+
+        # --- Force CPU-only validation ---
+        if hasattr(self.validator, "device"):
             self.validator.device = torch.device("cpu")
-        self.metrics = self.validator(trainer=self, model=model)
-        self.metrics.pop('fitness', None)
-        self.run_callbacks('on_fit_epoch_end')
+
+        for p in wrapped.parameters():
+            p.requires_grad_(False)
+
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # --- Run validation safely ---
+        LOGGER.info(f"\n🧩 Validating quantized model: {best_path}")
+        self.validator.qat = self.qat
+        self.validator.args.plots = self.args.plots
+        self.validator.args.verbose = True
+
+        try:
+            self.metrics = self.validator(trainer=self, model=wrapped)
+            self.metrics.pop('fitness', None)
+            LOGGER.info("✅ Final evaluation completed successfully.")
+        except Exception as e:
+            LOGGER.error(f"❌ Validation failed during final_eval(): {e}")
+        finally:
+            self.run_callbacks('on_fit_epoch_end')
+            torch.cuda.empty_cache()
+            gc.collect()
+
+
+# 전역 변수: 로그 기록용
+qat_scale_log = defaultdict(list)
+
+def log_qat_observer_status(model: torch.nn.Module, step: int = None):
+    """
+    QAT 중 FakeQuantObserver들의 scale 변화를 기록하고,
+    학습 종료 후 그래프로 저장하는 디버그 유틸리티.
+    """
+    global qat_scale_log
+
+    step = step or 0
+    count = 0
+    enabled_count = 0
+    disabled_count = 0
+
+    KEY_LAYERS = [
+        "model.0.conv.weight_fake_quant",
+        "model.0.conv.activation_post_process",
+        "model.4.cv1.conv.weight_fake_quant",
+        "model.4.cv1.conv.activation_post_process",
+        "model.22.dfl.conv.weight_fake_quant",
+        "model.22.dfl.conv.activation_post_process",
+    ]
+
+    key_scales = {}
+    for name, module in model.named_modules():
+        if isinstance(module, torch.ao.quantization.FakeQuantize):
+            count += 1
+            scale = getattr(module, "scale", None)
+            if scale is not None and (name.endswith("fake_quant") or name.endswith("activation_post_process")):
+                enabled_count += 1
+                if any(k in name for k in KEY_LAYERS):
+                    key_scales[name] = float(scale.mean())
+            else:
+                disabled_count += 1
+
+    print(f"\n[QAT DEBUG] Step {step}")
+    print(f" - Found {count} FakeQuant modules | Enabled: {enabled_count}, Disabled: {disabled_count}")
+    if len(key_scales) == 0:
+        print("⚠️ No matching FakeQuant modules with valid scale found.")
+    else:
+        print(" - Key scales:")
+        for k, v in key_scales.items():
+            print(f"   • {k:45s} scale ≈ {v:.6f}")
+            qat_scale_log[k].append((step, v))
